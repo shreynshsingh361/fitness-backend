@@ -1,0 +1,14 @@
+# Real secrets (keep .env.example, which holds only safe development defaults)
+.env
+.env.local
+
+# Go build output
+*.exe
+*.test
+*.out
+
+# OS
+.DS_Store
+
+# Downloaded food databases (large; fetched by scripts/import-foods.sh)
+data/

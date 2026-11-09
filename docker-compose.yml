@@ -1,0 +1,157 @@
+# The whole BACKEND with one command:  docker compose up --build
+#
+#   any client (the web app in the fitness-frontend project, a mobile app later)
+#      │
+#      └──────> gateway  :8080      (the ONLY port reachable from outside)
+#                  │
+#                  ├──> auth-service      :8081 ──> auth_db
+#                  ├──> workout-service   :8082 ──> workout_db
+#                  ├──> nutrition-service :8083 ──> nutrition_db
+#                  ├──> activity-service  :8084 ──> activity_db
+#                  └──> social-service    :8085 ──> social_db
+#                         └ also asks activity-service for steps and auth-service for names
+#
+# The services publish no ports to your machine: only containers on this compose
+# network can reach them. That is what makes it safe for them to trust the
+# X-User-ID header the gateway sets, and to offer /internal routes to each other.
+#
+# There is no frontend in this project. It lives in its own folder (fitness-frontend)
+# and only needs to be told where this gateway is.
+
+name: fitness-backend
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev_password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    # No `ports:` on purpose. The services reach Postgres over the compose network, and
+    # publishing 5432 would clash with any Postgres already installed on your machine.
+    # To use a GUI client, add:   ports: ["127.0.0.1:5433:5432"]
+    # To use psql with nothing installed:  docker compose exec postgres psql -U postgres -d workout_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  auth-service:
+    <<: *service-defaults
+    build: ./services/auth-service
+    environment:
+      PORT: "8081"
+      DATABASE_URL: postgres://auth_svc:auth_dev_password@postgres:5432/auth_db
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me-before-deploying}
+      APP_ENV: ${APP_ENV:-development}
+      # Your Firebase project's id. Empty = "Sign in with Firebase" is off.
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-}
+      # The old sign-up and login, where nobody checks the email. Off unless set to "true".
+      LEGACY_PASSWORD_AUTH: ${LEGACY_PASSWORD_AUTH:-false}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  workout-service:
+    <<: *service-defaults
+    build: ./services/workout-service
+    environment:
+      PORT: "8082"
+      DATABASE_URL: postgres://workout_svc:workout_dev_password@postgres:5432/workout_db
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8082/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nutrition-service:
+    <<: *service-defaults
+    build: ./services/nutrition-service
+    environment:
+      PORT: "8083"
+      DATABASE_URL: postgres://nutrition_svc:nutrition_dev_password@postgres:5432/nutrition_db
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8083/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  activity-service:
+    <<: *service-defaults
+    build: ./services/activity-service
+    environment:
+      PORT: "8084"
+      DATABASE_URL: postgres://activity_svc:activity_dev_password@postgres:5432/activity_db
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8084/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  social-service:
+    <<: *service-defaults
+    build: ./services/social-service
+    environment:
+      PORT: "8085"
+      DATABASE_URL: postgres://social_svc:social_dev_password@postgres:5432/social_db
+      # It owns no steps and no names, so it asks the services that do.
+      ACTIVITY_URL: http://activity-service:8084
+      AUTH_URL: http://auth-service:8081
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8085/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build: ./gateway
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me-before-deploying}
+      AUTH_URL: http://auth-service:8081
+      WORKOUT_URL: http://workout-service:8082
+      NUTRITION_URL: http://nutrition-service:8083
+      ACTIVITY_URL: http://activity-service:8084
+      SOCIAL_URL: http://social-service:8085
+      # Browser origins that may call this API (comma separated). The defaults are the
+      # web app (:3000) and the Flutter app when it runs in Chrome (:3100). Phone apps are
+      # not browsers and need no entry. For anything else, set CORS_ORIGINS in .env.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:3100}
+      APP_ENV: ${APP_ENV:-development}
+      # The load balancer in front of the gateway, if any (IPs or CIDRs, comma separated).
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      AUTH_ATTEMPTS_PER_MINUTE: ${AUTH_ATTEMPTS_PER_MINUTE:-20}
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      workout-service:
+        condition: service_healthy
+      nutrition-service:
+        condition: service_healthy
+      activity-service:
+        condition: service_healthy
+      social-service:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

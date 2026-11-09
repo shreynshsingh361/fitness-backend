@@ -1,0 +1,2175 @@
+openapi: 3.0.3
+info:
+  title: FitTrack API
+  version: 1.1.0
+  description: |
+    The single public API of the FitTrack system. Clients (the web app today, a
+    mobile app later) talk ONLY to the gateway. The gateway forwards each request
+    to the service that owns it:
+
+    | Path prefix | Service |
+    |---|---|
+    | `/auth/*` | auth-service |
+    | `/exercises`, `/workouts`, `/records` | workout-service |
+    | `/foods`, `/diary`, `/goals`, `/water`, `/nutrition/*` | nutrition-service |
+    | `/steps/*` | activity-service |
+    | `/friends/*`, `/nudges/*`, `/groups/*` | social-service |
+    | `/dashboard`, `/account/delete` | answered by the gateway itself (they span several services) |
+
+    **Privacy.** By default nobody but you can see your steps. Friends see you on the
+    friends board, and people in a group you joined see you on that group's boards.
+    Hiding someone works both ways: they stop seeing you and you stop seeing them, and
+    they are never told. Asking for something you may not see looks like a plain 404.
+
+    **Whose day is it?** Steps are stored against the user's own local date, so each
+    person's day ends at their own midnight.
+
+    **Authentication.** Log in to receive a short-lived access token (JWT, 15 minutes)
+    and a long-lived refresh token (30 days, single use). Send the access token as
+    `Authorization: Bearer <token>`. When it expires, trade the refresh token for a
+    new pair at `/auth/refresh`.
+
+    **Idempotency.** Endpoints that create things (`POST /workouts`, `POST /diary`)
+    require a `client_op_id` (a UUID the client generates once per action). Sending
+    the same `client_op_id` again returns the already-saved record with status 200
+    instead of creating a duplicate, so retries after a network failure are safe.
+
+    **Dates.** `date` / `eaten_on` values are calendar dates (`YYYY-MM-DD`) in the
+    user's own time zone. Timestamps are UTC (RFC 3339).
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local development (docker compose up)
+
+tags:
+  - name: Auth
+  - name: Workouts
+  - name: Nutrition
+  - name: Steps
+  - name: Friends
+  - name: Groups
+  - name: Dashboard
+  - name: Account
+
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Create an account
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+      responses:
+        "201":
+          description: Account created and signed in
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "409": { $ref: "#/components/responses/EmailTaken" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Sign in
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Signed in
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "401":
+          description: Wrong email or password (the same answer for both, so emails cannot be probed)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: Too many attempts from this address; wait for Retry-After seconds
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/firebase:
+    post:
+      tags: [Auth]
+      summary: Sign in with Firebase (email and password, or Google)
+      description: |
+        Send the ID token Firebase gave the app. Someone new gets an account; someone
+        with an account from before (same email) keeps it. The email must be verified.
+        Login, sign-up and this share a limit of attempts per IP address.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id_token]
+              properties:
+                id_token: { type: string, description: The Firebase ID token }
+                name: { type: string, description: Used only for a new account when Firebase has no name }
+      responses:
+        "200":
+          description: Signed in to an existing account
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "201":
+          description: A new account was made
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "401":
+          description: The token is not a valid Firebase sign-in for this project
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: The email is not verified yet (email_not_verified)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: This email's account is already tied to a different Firebase user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: Too many attempts from this address; wait for Retry-After seconds
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: Firebase sign-in is not set up on this server
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Trade a refresh token for a new token pair
+      description: Refresh tokens are single use. The old one stops working as soon as this succeeds.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: New tokens
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "401":
+          description: Refresh token is invalid, expired, revoked or already used
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke a refresh token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "204": { description: Signed out }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: The signed-in user
+      responses:
+        "200":
+          description: The user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    patch:
+      tags: [Auth]
+      summary: Change your name
+      description: The name friends and group members see.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+      responses:
+        "200":
+          description: The user, with the new name
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422":
+          description: The name is empty or too long
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dashboard:
+    get:
+      tags: [Dashboard]
+      summary: Today at a glance (workout + nutrition summary)
+      description: |
+        Answered by the gateway, which asks the workout and nutrition services at the
+        same time. If one service is down, its part is `null` and its name appears in
+        `unavailable`; the request still succeeds.
+      parameters:
+        - $ref: "#/components/parameters/Date"
+      responses:
+        "200":
+          description: Combined summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dashboard" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /exercises:
+    get:
+      tags: [Workouts]
+      summary: Search the exercise catalogue
+      parameters:
+        - name: search
+          in: query
+          schema: { type: string }
+          description: Case-insensitive match on the exercise name
+        - name: muscle_group
+          in: query
+          schema: { type: string, enum: [chest, back, legs, shoulders, arms, core] }
+        - name: body_part
+          in: query
+          schema: { $ref: "#/components/schemas/BodyPart" }
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of exercises
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageMeta"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Exercise" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /workouts:
+    post:
+      tags: [Workouts]
+      summary: Log a workout with its sets
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewWorkout" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workout" }
+        "200":
+          description: This `client_op_id` was already saved; the existing workout is returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workout" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    get:
+      tags: [Workouts]
+      summary: Your workout history, newest first
+      description: Each item has `set_count` and `volume_kg` but not the sets; fetch one workout for those.
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of workouts
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageMeta"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Workout" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /workouts/summary:
+    get:
+      tags: [Workouts]
+      summary: Totals for the last N days
+      parameters:
+        - name: days
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 365, default: 7 }
+      responses:
+        "200":
+          description: Summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkoutSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /workouts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Workouts]
+      summary: One workout with its sets
+      responses:
+        "200":
+          description: The workout
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workout" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Workouts]
+      summary: Delete a workout
+      description: Somebody else's workout looks exactly like a missing one (404).
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /records:
+    get:
+      tags: [Workouts]
+      summary: Your heaviest set for each exercise
+      responses:
+        "200":
+          description: Personal records, ordered by exercise name
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/PersonalRecord" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /plans:
+    get:
+      tags: [Workouts]
+      summary: How many exercises each of your body-part plans has
+      responses:
+        "200":
+          description: One item per body part, in the app's order (0 for plans not started)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        body_part: { $ref: "#/components/schemas/BodyPart" }
+                        exercise_count: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /plans/{part}:
+    parameters:
+      - name: part
+        in: path
+        required: true
+        schema: { $ref: "#/components/schemas/BodyPart" }
+    get:
+      tags: [Workouts]
+      summary: Your plan for one body part, its exercises in the order you added them
+      responses:
+        "200":
+          description: The plan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  body_part: { $ref: "#/components/schemas/BodyPart" }
+                  exercises:
+                    type: array
+                    items: { $ref: "#/components/schemas/PlanExercise" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /plans/{part}/exercises:
+    parameters:
+      - name: part
+        in: path
+        required: true
+        schema: { $ref: "#/components/schemas/BodyPart" }
+    post:
+      tags: [Workouts]
+      summary: Add a library exercise to the plan (it starts with 3 sets of 10 reps, weight 0, in kg)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [exercise_id]
+              properties:
+                exercise_id: { type: string, format: uuid, description: An exercise of this body part }
+      responses:
+        "201":
+          description: Added
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlanExercise" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The exercise is already in this plan (`already_in_plan`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: Unknown exercise, an exercise of another body part, or the plan already has 20
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /plans/{part}/exercises/{id}:
+    parameters:
+      - name: part
+        in: path
+        required: true
+        schema: { $ref: "#/components/schemas/BodyPart" }
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      tags: [Workouts]
+      summary: Set the unit and all the sets (1 to 10) of an exercise in the plan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [unit, sets]
+              properties:
+                unit: { type: string, enum: [kg, lb] }
+                sets:
+                  type: array
+                  minItems: 1
+                  maxItems: 10
+                  items: { $ref: "#/components/schemas/PlanSet" }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlanExercise" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [Workouts]
+      summary: Take an exercise out of the plan
+      responses:
+        "204": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /foods/barcode/{code}:
+    get:
+      tags: [Nutrition]
+      summary: Find the packaged product a scanned barcode belongs to
+      description: |
+        Looks in the catalogue first (UPC-A and EAN-13 spellings of one code are treated
+        as the same product). A product the catalogue lacks is fetched once from Open Food
+        Facts and kept, so the next scan finds it here. A product with no usable
+        nutrition information is refused rather than logged with made-up numbers.
+      parameters:
+        - name: code
+          in: path
+          required: true
+          description: 8 to 14 digits (EAN-8, UPC-A, EAN-13 or ITF-14)
+          schema: { type: string, pattern: "^[0-9]{8,14}$" }
+      responses:
+        "200":
+          description: The product, with nutrition per one serving
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Food" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No product has that barcode (`not_found`), or it lists no nutrition (`no_nutrition`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "502":
+          description: Open Food Facts could not be reached (`lookup_unavailable`); try again
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /foods:
+    get:
+      tags: [Nutrition]
+      summary: Search the food catalogue
+      description: |
+        Matches anywhere in the name or brand, ignoring case. Your own recipes come first
+        (nobody else sees them), then generic foods before packaged products, then names
+        that start with the search, then shorter names.
+        A search of one or two letters only looks at generic foods (it would match millions
+        of products). `total` is capped at 1000 while searching.
+      parameters:
+        - name: search
+          in: query
+          schema: { type: string }
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of foods (values are per one serving)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageMeta"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Food" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /recipes:
+    get:
+      tags: [Nutrition]
+      summary: Your recipes, by name
+      responses:
+        "200":
+          description: Every recipe you made
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Recipe" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Nutrition]
+      summary: Make a recipe from foods in the catalogue
+      description: |
+        One serving's nutrition is everything in it divided by `portions`. The recipe is
+        also a food (source `recipe`) that only you can see: search finds it, and adding its
+        `id` to the diary logs servings of it like any other food.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewRecipe" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Recipe" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422":
+          description: |
+            A field is invalid (`validation_error`), or an ingredient is not a catalogue food
+            (`unknown_food`: it does not exist, or it is a recipe; recipes cannot contain recipes)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /recipes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Nutrition]
+      summary: One of your recipes, with its ingredients
+      responses:
+        "200":
+          description: The recipe
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Recipe" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [Nutrition]
+      summary: Change a recipe (replaces it whole, ingredients included)
+      description: Days on which you already logged it keep the nutrition it had then.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewRecipe" }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Recipe" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: As for creating a recipe
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Nutrition]
+      summary: Delete a recipe
+      description: Days on which you logged it keep their entries (their `food_id` becomes null).
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /diary:
+    post:
+      tags: [Nutrition]
+      summary: Add a food to the diary
+      description: |
+        The food's nutrition is copied into the entry and multiplied by `servings`
+        (a snapshot), so editing the catalogue later never changes past days.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewDiaryEntry" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DiaryEntry" }
+        "200":
+          description: This `client_op_id` was already saved; the existing entry is returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DiaryEntry" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    get:
+      tags: [Nutrition]
+      summary: One day of your food diary, with totals
+      parameters:
+        - $ref: "#/components/parameters/Date"
+      responses:
+        "200":
+          description: Entries (oldest first) and their totals
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DiaryDay" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /diary/month:
+    get:
+      tags: [Nutrition]
+      summary: Calories eaten on each day of a month
+      description: Days with nothing logged are left out. Used by the calendar.
+      parameters:
+        - name: month
+          in: query
+          required: true
+          schema: { type: string, pattern: "^[0-9]{4}-[0-9]{2}$", example: "2026-11" }
+      responses:
+        "200":
+          description: The days of that month that have food in them
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [month, days]
+                properties:
+                  month: { type: string, example: "2026-11" }
+                  days:
+                    type: array
+                    items:
+                      type: object
+                      required: [date, calories]
+                      properties:
+                        date: { type: string, format: date }
+                        calories: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /diary/{id}:
+    delete:
+      tags: [Nutrition]
+      summary: Remove a diary entry
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /goals:
+    get:
+      tags: [Nutrition]
+      summary: Your daily calorie goal
+      responses:
+        "200":
+          description: The goal (2000 until you set your own)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Goal" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [Nutrition]
+      summary: Set your daily calorie goal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [calories]
+              properties:
+                calories: { type: integer, minimum: 500, maximum: 10000 }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Goal" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /water:
+    post:
+      tags: [Nutrition]
+      summary: Log water
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount_ml]
+              properties:
+                amount_ml: { type: integer, minimum: 1, maximum: 5000 }
+                date: { type: string, format: date, description: Defaults to today (UTC) }
+                client_op_id:
+                  type: string
+                  format: uuid
+                  description: Optional. The app makes one per tap; the same one sent twice (a retry after a lost reply, or sent later from the offline queue) is applied once.
+      responses:
+        "201":
+          description: Logged (or already logged under this client_op_id); returns the day's new total
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WaterDay" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    get:
+      tags: [Nutrition]
+      summary: Water logged on a day
+      parameters:
+        - $ref: "#/components/parameters/Date"
+      responses:
+        "200":
+          description: The day's total
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WaterDay" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [Nutrition]
+      summary: Reset a day's water, or take some off it
+      parameters:
+        - $ref: "#/components/parameters/Date"
+        - name: amount_ml
+          in: query
+          required: false
+          description: >-
+            Take only this much off instead of resetting the day. The newest logs go first,
+            and the day never drops below zero.
+          schema: { type: integer, minimum: 1, maximum: 5000 }
+        - name: client_op_id
+          in: query
+          required: false
+          description: Optional uuid, only with amount_ml. The same one sent twice takes the amount off once.
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: Reset, or the amount taken off }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /nutrition/summary:
+    get:
+      tags: [Nutrition]
+      summary: Calories, macros and water for one day
+      parameters:
+        - $ref: "#/components/parameters/Date"
+      responses:
+        "200":
+          description: The day's summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DaySummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /steps/sync:
+    post:
+      tags: [Steps]
+      summary: Sync step counts from a device or health app
+      description: |
+        Called by a client that can read a step sensor (a future mobile app reading
+        Apple Health or Android Health Connect). A device's count for a day only ever
+        goes up, so a retried or out-of-order sync can never lower it and is safe to repeat.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StepSyncRequest" }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  synced: { type: integer, description: Number of days saved }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /steps/today:
+    get:
+      tags: [Steps]
+      summary: One day's steps, goal progress and current streak
+      parameters:
+        - $ref: "#/components/parameters/Date"
+      responses:
+        "200":
+          description: The day
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepsDay" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /steps/history:
+    get:
+      tags: [Steps]
+      summary: Daily totals for a date range (days with no steps are included as 0)
+      parameters:
+        - name: from
+          in: query
+          description: Defaults to 6 days before `to`
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          description: Defaults to today (UTC). The range can be at most 366 days.
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: The days, oldest first
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepsHistory" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /steps/stats:
+    get:
+      tags: [Steps]
+      summary: Streaks, records, achievements and your rank in your country
+      parameters:
+        - $ref: "#/components/parameters/Date"
+      responses:
+        "200":
+          description: The stats
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepsStats" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /steps/settings:
+    get:
+      tags: [Steps]
+      summary: Your daily step goal and country
+      responses:
+        "200":
+          description: The settings (a 10,000 step goal until you set your own)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepSettings" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [Steps]
+      summary: Set your daily step goal and country
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [daily_goal]
+              properties:
+                daily_goal: { type: integer, minimum: 1000, maximum: 100000 }
+                country: { type: string, nullable: true, description: 'Two-letter code such as "IN". Empty or null removes it.', example: IN }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepSettings" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /friends:
+    get:
+      tags: [Friends]
+      summary: The friends leaderboard (you and your friends)
+      description: Hidden people are left out.
+      parameters:
+        - name: period
+          in: query
+          description: "yesterday is the day before `date`"
+          schema: { type: string, enum: [day, yesterday, week, month], default: day }
+        - $ref: "#/components/parameters/Date"
+      responses:
+        "200":
+          description: The board, best first
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FriendsBoard" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /friends/invite:
+    get:
+      tags: [Friends]
+      summary: Your personal invite code (the same one every time)
+      responses:
+        "200":
+          description: The code
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /friends/invite/{code}:
+    get:
+      tags: [Friends]
+      summary: Look at an invite before accepting it
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Who sent it
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  inviter_name: { type: string }
+                  is_self: { type: boolean }
+                  already_friends: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /friends/accept:
+    post:
+      tags: [Friends]
+      summary: Accept a friend invite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        "201":
+          description: You are now friends
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FriendRef" }
+        "200":
+          description: You were already friends
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FriendRef" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /friends/hidden:
+    get:
+      tags: [Friends]
+      summary: The people you have hidden
+      description: Only your own list. Nobody can find out who has hidden them.
+      responses:
+        "200":
+          description: The list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/HiddenUser" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /friends/{userId}:
+    delete:
+      tags: [Friends]
+      summary: Remove a friend
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "204": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /friends/{userId}/hide:
+    parameters:
+      - $ref: "#/components/parameters/UserId"
+    post:
+      tags: [Friends]
+      summary: Privately hide someone
+      responses:
+        "204": { description: Hidden }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [Friends]
+      summary: Stop hiding someone
+      responses:
+        "204": { description: No longer hidden }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /nudges:
+    post:
+      tags: [Friends]
+      summary: Send a cheer or a taunt
+      description: The other person must be your friend, or in `group_id` with you. At most one of each kind per person per hour.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_user_id, kind]
+              properties:
+                to_user_id: { type: string, format: uuid }
+                kind: { type: string, enum: [cheer, taunt] }
+                group_id: { type: string, format: uuid }
+      responses:
+        "201": { description: Sent }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: This group's admin has turned taunts off
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429":
+          description: You already sent this person one recently
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    get:
+      tags: [Friends]
+      summary: Cheers and taunts sent to you, newest first
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: The list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unread: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Nudge" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /nudges/read:
+    post:
+      tags: [Friends]
+      summary: Mark all your cheers and taunts as read
+      responses:
+        "204": { description: Done }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /groups:
+    post:
+      tags: [Groups]
+      summary: Create a group (you become its admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 80 }
+                description: { type: string, maxLength: 500 }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Group" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    get:
+      tags: [Groups]
+      summary: The groups you are in
+      responses:
+        "200":
+          description: The list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Group" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /groups/invite/{code}:
+    get:
+      tags: [Groups]
+      summary: Look at a group invite before joining
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The group
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupPreview" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /groups/join:
+    post:
+      tags: [Groups]
+      summary: Join a group with its invite code
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        "201":
+          description: Joined
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Group" }
+        "200":
+          description: You were already in this group
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Group" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: An admin removed you from this group
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The group has reached its limit of 100 members
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /groups/{groupId}:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [Groups]
+      summary: One of your groups
+      responses:
+        "200":
+          description: The group
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Group" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Groups]
+      summary: Change a group's name or settings (admins only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GroupPatch" }
+      responses:
+        "200":
+          description: The updated group
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Group" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [Groups]
+      summary: Delete a group and its chat (admins only)
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /groups/{groupId}/challenge:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    put:
+      tags: [Groups]
+      summary: Set a fixed-date challenge (admins only)
+      description: From 1 day to 1 year long. The group carries on after the end date, and the results stay visible until an admin changes or clears it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [start, end]
+              properties:
+                start: { type: string, format: date }
+                end: { type: string, format: date }
+      responses:
+        "200":
+          description: The updated group
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Group" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [Groups]
+      summary: Clear the fixed-date challenge (admins only)
+      responses:
+        "200":
+          description: The updated group
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Group" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /groups/{groupId}/leaderboard:
+    get:
+      tags: [Groups]
+      summary: A group's step leaderboard
+      description: |
+        Leaderboards need no start or stop: they are worked out from everyone's steps
+        whenever they are asked for. `week` is Monday to Sunday and `month` is the calendar
+        month containing `date`; `challenge` is the group's fixed-date range.
+
+        In mystery mode only ranks are shown for dates that are not over yet. A date is
+        revealed once it has ended everywhere on Earth, so nobody who is still walking can
+        be read off the board. You always see your own count.
+      parameters:
+        - $ref: "#/components/parameters/GroupId"
+        - name: period
+          in: query
+          description: "yesterday is the day before `date`"
+          schema: { type: string, enum: [day, yesterday, week, month, challenge], default: day }
+        - $ref: "#/components/parameters/Date"
+        - $ref: "#/components/parameters/Page"
+        - name: limit
+          in: query
+          description: Page size (capped at 100)
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        "200":
+          description: The board, best first
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Leaderboard" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "503":
+          description: Step data is temporarily unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /groups/{groupId}/report.csv:
+    get:
+      tags: [Groups]
+      summary: Download a report for any date range as CSV (admins only)
+      description: Defaults to the challenge dates if set, otherwise the current month. In mystery mode the report stops before the first date that is still hidden.
+      parameters:
+        - $ref: "#/components/parameters/GroupId"
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: One row per member, best first
+          content:
+            text/csv:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "503":
+          description: Step data is temporarily unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /groups/{groupId}/members:
+    get:
+      tags: [Groups]
+      summary: A group's members
+      parameters:
+        - $ref: "#/components/parameters/GroupId"
+        - $ref: "#/components/parameters/Page"
+        - name: limit
+          in: query
+          description: Page size (capped at 100)
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        "200":
+          description: A page of members
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageMeta"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Member" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /groups/{groupId}/members/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+      - $ref: "#/components/parameters/UserId"
+    patch:
+      tags: [Groups]
+      summary: Make someone an admin, or a plain member again (admins only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { type: string, enum: [admin, member] }
+      responses:
+        "204": { description: Changed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: A group must keep at least one admin
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [Groups]
+      summary: Remove someone from the group (admins only)
+      description: They cannot rejoin with the invite link.
+      responses:
+        "204": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /groups/{groupId}/leave:
+    post:
+      tags: [Groups]
+      summary: Leave a group
+      description: If the last admin leaves, the longest-standing member becomes admin. If nobody is left, the group is deleted.
+      parameters:
+        - $ref: "#/components/parameters/GroupId"
+      responses:
+        "204": { description: Left }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /groups/{groupId}/messages:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [Groups]
+      summary: Group chat messages, oldest first
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: before
+          in: query
+          description: Only messages older than this time, for loading earlier pages
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: The messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chat_enabled: { type: boolean }
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Message" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Groups]
+      summary: Post a chat message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        "201":
+          description: Posted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: This group's admin has turned chat off
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /groups/{groupId}/messages/{messageId}:
+    delete:
+      tags: [Groups]
+      summary: Remove a chat message (its author or an admin)
+      parameters:
+        - $ref: "#/components/parameters/GroupId"
+        - name: messageId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /account/delete:
+    post:
+      tags: [Account]
+      summary: Permanently delete your account and all your data
+      description: |
+        Needs your password, or, for an account that signs in with Firebase, a
+        Firebase ID token from a sign-in in the last 5 minutes. Your data is removed
+        from every service first and your login last, so if a service is down you can
+        sign in and simply try again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: One of the two
+              properties:
+                password: { type: string, format: password }
+                firebase_id_token: { type: string }
+      responses:
+        "204": { description: Everything is gone }
+        "401":
+          description: Not signed in, or the password is wrong
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "502":
+          description: A service did not answer. Nothing is lost by retrying.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      description: Page size (capped at 100)
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Date:
+      name: date
+      in: query
+      description: Calendar date in the user's time zone. Defaults to today (UTC).
+      schema: { type: string, format: date, example: "2026-11-07" }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    GroupId:
+      name: groupId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: Missing, invalid or expired access token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such record (or it belongs to someone else)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: One or more fields are invalid; `details` names each one
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            code: validation_error
+            message: some fields are invalid
+            details: { password: must be between 8 and 72 characters }
+    EmailTaken:
+      description: An account with this email already exists
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    AdminOnly:
+      description: Only a group admin can do this
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      description: Every error from every service has this shape.
+      required: [code, message]
+      properties:
+        code: { type: string, example: validation_error }
+        message: { type: string }
+        details:
+          type: object
+          additionalProperties: { type: string }
+
+    PageMeta:
+      type: object
+      required: [page, limit, total]
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer, description: Number of matching records across all pages }
+
+    # ---------- auth ----------
+    RegisterRequest:
+      type: object
+      required: [name, email, password]
+      properties:
+        name: { type: string, maxLength: 80 }
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8, maxLength: 72, format: password }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+    AuthResponse:
+      type: object
+      properties:
+        user: { $ref: "#/components/schemas/User" }
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, example: Bearer }
+        expires_in: { type: integer, description: Seconds until the access token expires, example: 900 }
+
+    # ---------- workouts ----------
+    Exercise:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Back Squat }
+        muscle_group: { type: string, example: legs }
+        equipment: { type: string, example: barbell }
+        body_part: { $ref: "#/components/schemas/BodyPart" }
+        motion: { type: string, example: squat, description: Which animation the app plays; none for no animation }
+        muscles: { type: string, example: "Quads, glutes" }
+    BodyPart:
+      type: string
+      enum: [back, biceps, triceps, forearms, chest, legs, abs, shoulders]
+    PlanSet:
+      type: object
+      required: [weight, reps]
+      properties:
+        weight: { type: number, minimum: 0, maximum: 551, description: "In the exercise's unit: at most 250 in kg, 551 in lb" }
+        reps: { type: integer, minimum: 1, maximum: 1000 }
+    PlanExercise:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        exercise: { $ref: "#/components/schemas/Exercise" }
+        unit: { type: string, enum: [kg, lb] }
+        sets:
+          type: array
+          items: { $ref: "#/components/schemas/PlanSet" }
+    NewWorkout:
+      type: object
+      required: [client_op_id, name, sets]
+      properties:
+        client_op_id: { type: string, format: uuid, description: Generate once per workout; reuse it when retrying }
+        name: { type: string, maxLength: 100 }
+        notes: { type: string, maxLength: 1000 }
+        started_at: { type: string, format: date-time, description: Defaults to now }
+        duration_minutes: { type: integer, minimum: 0, maximum: 1440 }
+        sets:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: object
+            required: [exercise_id, reps, weight_kg]
+            properties:
+              exercise_id: { type: string, format: uuid }
+              reps: { type: integer, minimum: 1, maximum: 1000 }
+              weight_kg: { type: number, minimum: 0, maximum: 1000 }
+    WorkoutSet:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        exercise_id: { type: string, format: uuid }
+        exercise_name: { type: string }
+        position: { type: integer }
+        reps: { type: integer }
+        weight_kg: { type: number }
+    Workout:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        notes: { type: string }
+        started_at: { type: string, format: date-time }
+        duration_minutes: { type: integer }
+        created_at: { type: string, format: date-time }
+        set_count: { type: integer }
+        volume_kg: { type: number, description: Sum of reps x weight over all sets }
+        sets:
+          type: array
+          description: Only present when a single workout is fetched or created
+          items: { $ref: "#/components/schemas/WorkoutSet" }
+    WorkoutSummary:
+      type: object
+      properties:
+        days: { type: integer }
+        workouts: { type: integer }
+        total_sets: { type: integer }
+        volume_kg: { type: number }
+        last_workout_at: { type: string, format: date-time, nullable: true }
+    PersonalRecord:
+      type: object
+      properties:
+        exercise_id: { type: string, format: uuid }
+        exercise_name: { type: string }
+        weight_kg: { type: number }
+        reps: { type: integer }
+        achieved_at: { type: string, format: date-time }
+
+    # ---------- nutrition ----------
+    Food:
+      type: object
+      description: |
+        Nutrition values are per one `serving`. Foods come from five places: a few of
+        our own (`hxvy`), USDA FoodData Central (`usda`, public domain), Open Food Facts
+        (`off`, Open Database License: apps showing these must credit Open Food Facts),
+        the Indian Nutrient Databank (`indb`, Indian dishes, CC BY 4.0: apps must credit it)
+        and your own recipes (`recipe`, only ever shown to you).
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        brand: { type: string, description: Empty for generic foods., example: Amul }
+        source: { type: string, enum: [hxvy, usda, off, indb, recipe] }
+        serving: { type: string, example: 1 large egg (50 g) }
+        calories: { type: integer }
+        protein_g: { type: number }
+        carbs_g: { type: number }
+        fat_g: { type: number }
+    NewRecipe:
+      type: object
+      required: [name, portions, ingredients]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100, example: "Mom's dal" }
+        portions: { type: integer, minimum: 1, maximum: 100, description: How many servings it makes }
+        cooked_weight_g:
+          type: number
+          minimum: 1
+          maximum: 50000
+          nullable: true
+          description: The whole dish once cooked. With it, one serving says what it weighs and can be logged in grams.
+        ingredients:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: object
+            required: [food_id, servings]
+            properties:
+              food_id: { type: string, format: uuid, description: A catalogue food (not a recipe) }
+              servings: { type: number, minimum: 0.01, maximum: 1000, description: Servings of that food that go in }
+    Ingredient:
+      type: object
+      properties:
+        food: { $ref: "#/components/schemas/Food" }
+        servings: { type: number }
+    Recipe:
+      type: object
+      description: Nutrition values are per one serving. `id` is also its food id.
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        portions: { type: integer }
+        cooked_weight_g: { type: number, nullable: true }
+        serving: { type: string, example: 1 serving (300 g) }
+        calories: { type: integer }
+        protein_g: { type: number }
+        carbs_g: { type: number }
+        fat_g: { type: number }
+        ingredients:
+          type: array
+          items: { $ref: "#/components/schemas/Ingredient" }
+        updated_at: { type: string, format: date-time }
+    NewDiaryEntry:
+      type: object
+      required: [client_op_id, food_id, meal, servings]
+      properties:
+        client_op_id: { type: string, format: uuid, description: Generate once per entry }
+        food_id: { type: string, format: uuid, description: A catalogue food or one of your recipes }
+        meal: { type: string, enum: [breakfast, lunch, dinner, snack] }
+        servings: { type: number, minimum: 0.01, maximum: 100, description: "Grams typed in the app become servings: 250 g of a 100 g serving is 2.5." }
+        eaten_on: { type: string, format: date, description: Defaults to today (UTC) }
+    DiaryEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        eaten_on: { type: string, format: date }
+        meal: { type: string, enum: [breakfast, lunch, dinner, snack] }
+        food_id: { type: string, format: uuid, nullable: true }
+        food_name: { type: string }
+        serving: { type: string }
+        servings: { type: number }
+        calories: { type: integer, description: Already multiplied by servings }
+        protein_g: { type: number }
+        carbs_g: { type: number }
+        fat_g: { type: number }
+        created_at: { type: string, format: date-time }
+    Totals:
+      type: object
+      properties:
+        calories: { type: integer }
+        protein_g: { type: number }
+        carbs_g: { type: number }
+        fat_g: { type: number }
+    DiaryDay:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/DiaryEntry" }
+        totals: { $ref: "#/components/schemas/Totals" }
+    Goal:
+      type: object
+      properties:
+        calories: { type: integer }
+        is_default: { type: boolean, description: true until the user sets their own goal }
+    WaterDay:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        water_ml: { type: integer }
+    DaySummary:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        calories_eaten: { type: integer }
+        calories_goal: { type: integer }
+        protein_g: { type: number }
+        carbs_g: { type: number }
+        fat_g: { type: number }
+        water_ml: { type: integer }
+        entry_count: { type: integer }
+
+    # ---------- steps ----------
+    StepSyncRequest:
+      type: object
+      required: [source, days]
+      properties:
+        source:
+          type: string
+          enum: [phone, apple_health, health_connect, fitbit, garmin, samsung]
+        days:
+          type: array
+          minItems: 1
+          maxItems: 60
+          description: Up to 60 days per request. Each date may be up to 10 years back, so a first sync can bring in the whole history, 60 days at a time.
+          items:
+            type: object
+            required: [date, steps]
+            properties:
+              date: { type: string, format: date }
+              steps: { type: integer, minimum: 0, maximum: 200000 }
+    StepSource:
+      type: object
+      properties:
+        source: { type: string, example: apple_health }
+        steps: { type: integer }
+    StepsDay:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        steps:
+          type: integer
+          description: The highest count from any source. Sources are never added together, because a phone and a watch count the same walk.
+        goal: { type: integer }
+        goal_met: { type: boolean }
+        distance_km: { type: number, description: Estimated from the step count }
+        calories: { type: integer, description: Estimated from the step count }
+        sources:
+          type: array
+          items: { $ref: "#/components/schemas/StepSource" }
+        current_streak: { type: integer, description: Days in a row at or above the goal. Today does not break it until today is over. }
+    StepsHistory:
+      type: object
+      properties:
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        goal: { type: integer }
+        total_steps: { type: integer }
+        average_steps: { type: integer }
+        days:
+          type: array
+          items:
+            type: object
+            properties:
+              date: { type: string, format: date }
+              steps: { type: integer }
+              goal_met: { type: boolean }
+              distance_km: { type: number }
+              calories: { type: integer }
+    Achievement:
+      type: object
+      properties:
+        id: { type: string, example: streak_7 }
+        title: { type: string }
+        description: { type: string }
+        period: { type: string, enum: [daily, weekly, all_time], description: daily and weekly ones start over each day and week }
+        earned: { type: boolean }
+        earned_on: { type: string, format: date, nullable: true }
+    StepsStats:
+      type: object
+      properties:
+        current_streak: { type: integer }
+        longest_streak: { type: integer }
+        best_day:
+          type: object
+          nullable: true
+          properties:
+            date: { type: string, format: date }
+            steps: { type: integer }
+        best_week:
+          type: object
+          nullable: true
+          properties:
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+            steps: { type: integer }
+        lifetime_steps: { type: integer }
+        lifetime_distance_km: { type: number }
+        days_tracked: { type: integer }
+        this_week:
+          type: object
+          properties:
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+            steps: { type: integer }
+            days_goal_met: { type: integer }
+        achievements:
+          type: array
+          items: { $ref: "#/components/schemas/Achievement" }
+        country_rank:
+          type: object
+          nullable: true
+          description: Only your own position this week, never anyone else's name or steps. Null until you set a country.
+          properties:
+            country: { type: string }
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+            rank: { type: integer }
+            total_users: { type: integer }
+            top_100: { type: boolean }
+    StepSettings:
+      type: object
+      properties:
+        daily_goal: { type: integer }
+        country: { type: string, nullable: true }
+        is_default: { type: boolean, description: true until the user saves their own settings }
+
+    # ---------- friends ----------
+    FriendRef:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        name: { type: string }
+    BoardRow:
+      type: object
+      properties:
+        rank: { type: integer, description: People with the same steps share a rank }
+        user_id: { type: string, format: uuid }
+        name: { type: string }
+        steps: { type: integer }
+        is_me: { type: boolean }
+    FriendsBoard:
+      type: object
+      properties:
+        period: { type: string, enum: [day, yesterday, week, month] }
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        steps_available: { type: boolean, description: false if the step service did not answer; everyone then shows 0 }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/BoardRow" }
+    HiddenUser:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        name: { type: string }
+    Nudge:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        from_user_id: { type: string, format: uuid }
+        from_name: { type: string }
+        kind: { type: string, enum: [cheer, taunt] }
+        group_id: { type: string, format: uuid, nullable: true }
+        group_name: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        read: { type: boolean }
+
+    # ---------- groups ----------
+    Group:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        invite_code: { type: string }
+        mystery_mode: { type: boolean, description: Only ranks are shown for dates that are not over yet }
+        chat_enabled: { type: boolean }
+        taunts_enabled: { type: boolean }
+        challenge_start: { type: string, format: date, nullable: true }
+        challenge_end: { type: string, format: date, nullable: true }
+        created_at: { type: string, format: date-time }
+        member_count: { type: integer }
+        my_role: { type: string, enum: [admin, member] }
+    GroupPatch:
+      type: object
+      description: Send only the fields to change.
+      properties:
+        name: { type: string, maxLength: 80 }
+        description: { type: string, maxLength: 500 }
+        mystery_mode: { type: boolean }
+        chat_enabled: { type: boolean }
+        taunts_enabled: { type: boolean }
+    GroupPreview:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        member_count: { type: integer }
+        is_member: { type: boolean }
+    Member:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        name: { type: string }
+        role: { type: string, enum: [admin, member] }
+        joined_at: { type: string, format: date-time }
+        is_me: { type: boolean }
+    LeaderboardRow:
+      type: object
+      properties:
+        rank: { type: integer, description: People with the same steps share a rank }
+        user_id: { type: string, format: uuid }
+        name: { type: string }
+        steps:
+          type: integer
+          nullable: true
+          description: Null when mystery mode hides this person's whole period. Otherwise, in mystery mode, only the steps from dates already revealed.
+        steps_hidden: { type: boolean, description: true when some or all of this count is being held back by mystery mode }
+        is_me: { type: boolean }
+    Leaderboard:
+      type: object
+      properties:
+        period: { type: string, enum: [day, yesterday, week, month, challenge] }
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        mystery_active: { type: boolean, description: true when mystery mode is hiding part of this period }
+        revealed_through: { type: string, format: date, description: In mystery mode, the last date whose counts are visible }
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/LeaderboardRow" }
+        me:
+          allOf: [{ $ref: "#/components/schemas/LeaderboardRow" }]
+          description: Your own row, even when it is not on this page
+    Message:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        name: { type: string }
+        body: { type: string, description: Empty when the message was removed }
+        removed: { type: boolean }
+        mine: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    # ---------- dashboard ----------
+    Dashboard:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        workouts:
+          allOf: [{ $ref: "#/components/schemas/WorkoutSummary" }]
+          nullable: true
+        nutrition:
+          allOf: [{ $ref: "#/components/schemas/DaySummary" }]
+          nullable: true
+        steps:
+          allOf: [{ $ref: "#/components/schemas/StepsDay" }]
+          nullable: true
+        unavailable:
+          type: array
+          description: Names of services that did not answer ("workouts", "nutrition", "steps")
+          items: { type: string }
