@@ -2,33 +2,20 @@ package store_test
 
 import (
 	"context"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
-	"fitness/nutrition-service/internal/database"
 	"fitness/nutrition-service/internal/store"
 )
 
-// These run against a real, empty Postgres: set NUTRITION_TEST_DATABASE_URL to one.
-// Never point it at a database with real data in it.
+// Water requests are retried by the offline queue and by lost replies, so a repeat must change
+// nothing. Needs a throwaway Postgres (see testPool).
 func TestWaterRequestsSentTwiceAreAppliedOnce(t *testing.T) {
-	url := os.Getenv("NUTRITION_TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("NUTRITION_TEST_DATABASE_URL is not set")
-	}
 	ctx := context.Background()
-	pool, err := database.Connect(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	if err := database.Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
+	pool := testPool(t)
 	s := store.New(pool)
 	user := uuid.NewString()
 	day := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)

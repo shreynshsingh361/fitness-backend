@@ -21,6 +21,7 @@ import (
 )
 
 func main() {
+	setupLogging()
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -57,6 +58,10 @@ func main() {
 		Addr:              ":" + cfg.Port,
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second, // a client that sends a byte a minute cannot hold a connection
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 
 	go func() {

@@ -13,9 +13,12 @@
 package gateway
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -30,13 +33,15 @@ import (
 const tokenIssuer = "fitness-auth"
 
 type Config struct {
-	JWTSecret    string
-	AuthURL      string
-	WorkoutURL   string
-	NutritionURL string
-	ActivityURL  string
-	SocialURL    string
-	CORSOrigins  string
+	JWTSecret string
+	// JWTSecretPrevious is accepted too while rotating the secret (see the config package).
+	JWTSecretPrevious string
+	AuthURL           string
+	WorkoutURL        string
+	NutritionURL      string
+	ActivityURL       string
+	SocialURL         string
+	CORSOrigins       string
 	// TrustedProxies are the proxies in front of the gateway (a hosting platform's
 	// load balancer), as IPs or CIDRs. Only they may say who the client is with
 	// X-Forwarded-For; without any, the client is whoever connected.
@@ -53,8 +58,13 @@ type route struct {
 }
 
 type gateway struct {
-	secret   []byte
-	attempts *limiter // sign-in, sign-up and account deletion, per IP
+	secrets  map[string][]byte // signing secrets by key id: the current one and, while rotating, the previous
+	current  []byte            // the current secret, for tokens that carry no key id
+	attempts *limiter          // sign-in, sign-up and account deletion, per IP
+	perUser  *limiter          // every request of a signed-in user, per user id
+	barcodes *limiter          // barcode lookups, per user id
+	metrics  *metrics          // request counts and latency, served at /metrics
+	accounts *accountChecker   // refuses tokens of deleted accounts
 	routes   []route
 	services map[string]string // service name -> base URL (for health checks, the dashboard, account deletion)
 	client   *http.Client
@@ -84,8 +94,12 @@ func New(cfg Config) (*gin.Engine, error) {
 	}
 
 	g := &gateway{
-		secret:   []byte(cfg.JWTSecret),
+		secrets:  signingSecrets(cfg.JWTSecret, cfg.JWTSecretPrevious),
+		current:  []byte(cfg.JWTSecret),
 		attempts: newLimiter(attemptsPerMinute(cfg.AuthAttemptsPerMinute), time.Minute),
+		perUser:  newLimiter(userRequestsPerMinute, time.Minute),
+		barcodes: newLimiter(barcodeLookupsPerMinute, time.Minute),
+		metrics:  newMetrics(),
 		// The first matching prefix wins, so specific public routes come first.
 		//
 		// This table is also a security boundary. The services' /internal routes
@@ -125,17 +139,20 @@ func New(cfg Config) (*gin.Engine, error) {
 		},
 		client: &http.Client{Timeout: 5 * time.Second},
 	}
+	g.accounts = newAccountChecker(g.services["auth"], g.client)
 
 	r := gin.New()
 	if err := r.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		return nil, fmt.Errorf("TRUSTED_PROXIES: %w", err)
 	}
-	r.Use(gin.Recovery(), requestID(), cors(cfg.CORSOrigins), requestLog())
+	r.Use(gin.Recovery(), requestID(), cors(cfg.CORSOrigins), requestLog(), g.metrics.middleware(), bodyLimit())
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "gateway"})
 	})
 	r.GET("/health/services", g.serviceHealth)
+	r.GET("/ready", g.ready)
+	r.GET("/metrics", g.metrics.handler)
 	r.GET("/api/v1/dashboard", g.dashboard)
 	r.POST("/api/v1/account/delete", g.deleteAccount)
 
@@ -166,7 +183,7 @@ func (g *gateway) forward(c *gin.Context) {
 		return
 	}
 
-	if limitedPaths[c.Request.URL.Path] && !g.attempts.limit(c) {
+	if limitedPaths[c.Request.URL.Path] && !g.attempts.limit(c, c.ClientIP()) {
 		return
 	}
 
@@ -177,6 +194,9 @@ func (g *gateway) forward(c *gin.Context) {
 		if err != nil {
 			c.Header("WWW-Authenticate", `Bearer realm="fitness"`)
 			fail(c, http.StatusUnauthorized, "unauthorized", "missing, invalid or expired access token", nil)
+			return
+		}
+		if !g.limitUser(c, userID) {
 			return
 		}
 		c.Request.Header.Set("X-User-ID", userID)
@@ -213,7 +233,7 @@ func (g *gateway) authenticate(r *http.Request) (string, error) {
 	}
 	claims := &jwt.RegisteredClaims{}
 	_, err := jwt.ParseWithClaims(raw, claims,
-		func(*jwt.Token) (any, error) { return g.secret, nil },
+		func(t *jwt.Token) (any, error) { return g.keyFor(t), nil },
 		jwt.WithValidMethods([]string{"HS256"}),
 		jwt.WithIssuer(tokenIssuer),
 		jwt.WithExpirationRequired(),
@@ -223,6 +243,15 @@ func (g *gateway) authenticate(r *http.Request) (string, error) {
 	}
 	if _, err := uuid.Parse(claims.Subject); err != nil {
 		return "", errors.New("token subject is not a user id")
+	}
+	// A valid token is not enough: the account may have been deleted since it was issued.
+	requestID := r.Header.Get("X-Request-ID")
+	exists, err := g.accounts.check(r.Context(), claims.Subject, requestID)
+	switch {
+	case err != nil:
+		warnUnchecked(requestID, err) // auth cannot be asked: keep signed-in people working
+	case !exists:
+		return "", errAccountGone
 	}
 	return claims.Subject, nil
 }
@@ -289,17 +318,27 @@ func cors(allowed string) gin.HandlerFunc {
 	}
 }
 
+// requestLog writes one structured log line per request (not for the health checks): the request
+// id, the route, the status, which service answered and how long it took. A 5xx is an error.
 func requestLog() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
+		path := c.Request.URL.Path
+		if path == "/health" || path == "/ready" {
+			return
+		}
 		upstream := c.GetString("upstream")
 		if upstream == "" {
 			upstream = "-"
 		}
-		log.Printf("req=%s %s %s -> %d via=%s (%s)",
-			c.Request.Header.Get("X-Request-ID"), c.Request.Method, c.Request.URL.Path,
-			c.Writer.Status(), upstream, time.Since(start).Round(time.Millisecond))
+		level := slog.LevelInfo
+		if c.Writer.Status() >= http.StatusInternalServerError {
+			level = slog.LevelError
+		}
+		slog.Log(c.Request.Context(), level, "request",
+			"req", c.Request.Header.Get("X-Request-ID"), "method", c.Request.Method, "path", path,
+			"status", c.Writer.Status(), "via", upstream, "ms", time.Since(start).Milliseconds())
 	}
 }
 
@@ -314,4 +353,33 @@ type errorBody struct {
 
 func fail(c *gin.Context, status int, code, message string, details map[string]string) {
 	c.AbortWithStatusJSON(status, errorBody{Code: code, Message: message, Details: details})
+}
+
+// keyID names a secret by the first eight hex digits of its SHA-256, the same name the auth service
+// puts in the "kid" header of the tokens it signs.
+func keyID(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:4])
+}
+
+// signingSecrets maps key ids to the secrets whose tokens are accepted: the current one, and the
+// previous one while a rotation is under way.
+func signingSecrets(current, previous string) map[string][]byte {
+	keys := map[string][]byte{keyID(current): []byte(current)}
+	if previous != "" {
+		keys[keyID(previous)] = []byte(previous)
+	}
+	return keys
+}
+
+// keyFor picks the secret to check a token with: the one its "kid" header names, or the current
+// one for a token with no key id. An unknown key id gets the current secret too, so the check
+// fails on the signature like any other forgery instead of revealing which ids exist.
+func (g *gateway) keyFor(t *jwt.Token) []byte {
+	if kid, _ := t.Header["kid"].(string); kid != "" {
+		if secret, ok := g.secrets[kid]; ok {
+			return secret
+		}
+	}
+	return g.current
 }

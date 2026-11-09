@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,7 +25,18 @@ func WithRequestID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, contextKey{}, id)
 }
 
-func postJSON(ctx context.Context, client *http.Client, url string, in, out any) error {
+// itoa writes a small integer as text (the status code in an error message).
+func itoa(n int) string { return strconv.Itoa(n) }
+
+// postJSON sends in as JSON to url and reads the answer into out. It is used for the lookups this
+// service makes (step totals, names), which only read, so they are safe to try again: the call
+// goes through c, with retries and a circuit breaker.
+func postJSON(ctx context.Context, c *caller, client *http.Client, url string, in, out any) error {
+	return c.do(ctx, func() error { return postJSONOnce(ctx, client, url, in, out) })
+}
+
+// postJSONOnce makes a single attempt of postJSON.
+func postJSONOnce(ctx context.Context, client *http.Client, url string, in, out any) error {
 	body, err := json.Marshal(in)
 	if err != nil {
 		return err
@@ -44,20 +56,23 @@ func postJSON(ctx context.Context, client *http.Client, url string, in, out any)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("POST %s: unexpected status %d", url, resp.StatusCode)
+		return fmt.Errorf("POST %s: %w", url, statusError{resp.StatusCode})
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 // ---------- activity service ----------
 
+// Activity is the activity service, which owns everyone's steps.
 type Activity struct {
 	base   string
 	client *http.Client
+	caller *caller
 }
 
+// NewActivity returns a client for the activity service at base.
 func NewActivity(base string) *Activity {
-	return &Activity{base: strings.TrimRight(base, "/"), client: &http.Client{Timeout: 10 * time.Second}}
+	return &Activity{base: strings.TrimRight(base, "/"), client: &http.Client{Timeout: 10 * time.Second}, caller: newCaller()}
 }
 
 type TotalsRequest struct {
@@ -81,7 +96,7 @@ func (a *Activity) Totals(ctx context.Context, req TotalsRequest) (map[string]Us
 	var out struct {
 		Totals []UserTotal `json:"totals"`
 	}
-	if err := postJSON(ctx, a.client, a.base+"/internal/steps/totals", req, &out); err != nil {
+	if err := postJSON(ctx, a.caller, a.client, a.base+"/internal/steps/totals", req, &out); err != nil {
 		return nil, err
 	}
 	totals := make(map[string]UserTotal, len(out.Totals))
@@ -93,13 +108,16 @@ func (a *Activity) Totals(ctx context.Context, req TotalsRequest) (map[string]Us
 
 // ---------- auth service ----------
 
+// Auth is the auth service, which owns names and logins.
 type Auth struct {
 	base   string
 	client *http.Client
+	caller *caller
 }
 
+// NewAuth returns a client for the auth service at base.
 func NewAuth(base string) *Auth {
-	return &Auth{base: strings.TrimRight(base, "/"), client: &http.Client{Timeout: 5 * time.Second}}
+	return &Auth{base: strings.TrimRight(base, "/"), client: &http.Client{Timeout: 5 * time.Second}, caller: newCaller()}
 }
 
 // Names looks up display names by user id. Unknown ids are simply missing.
@@ -114,7 +132,7 @@ func (a *Auth) Names(ctx context.Context, ids []string) (map[string]string, erro
 			} `json:"users"`
 		}
 		in := map[string][]string{"ids": ids[start:end]}
-		if err := postJSON(ctx, a.client, a.base+"/internal/users/lookup", in, &out); err != nil {
+		if err := postJSON(ctx, a.caller, a.client, a.base+"/internal/users/lookup", in, &out); err != nil {
 			return nil, err
 		}
 		for _, u := range out.Users {

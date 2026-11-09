@@ -62,9 +62,10 @@ func (l *limiter) allow(key string) (bool, time.Duration) {
 	return true, 0
 }
 
-// limit answers 429 once a client has used up its requests.
-func (l *limiter) limit(c *gin.Context) bool {
-	ok, wait := l.allow(c.ClientIP())
+// limit counts one request from key (an IP address, or a user id) and answers 429 with a
+// Retry-After header once that key has used up its requests. It returns false after answering.
+func (l *limiter) limit(c *gin.Context, key string) bool {
+	ok, wait := l.allow(key)
 	if ok {
 		return true
 	}

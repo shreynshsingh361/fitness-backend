@@ -94,20 +94,20 @@ func (g *gateway) getJSON(ctx context.Context, target, userID, requestID string)
 	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 }
 
-// serviceHealth asks every service whether it is alive. Handy when something
-// does not work: it shows which container is the problem.
-func (g *gateway) serviceHealth(c *gin.Context) {
+// probeServices asks every service for path (/health or /ready) in parallel, with a shared three
+// second deadline. It returns each service's "up" or "down" and whether all of them are up.
+func (g *gateway) probeServices(ctx context.Context, path string) (services gin.H, allUp bool) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
 	type check struct {
 		name string
 		up   bool
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
-	defer cancel()
-
 	results := make(chan check, len(g.services))
 	for name, base := range g.services {
 		go func() {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/health", nil)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
 			if err != nil {
 				results <- check{name, false}
 				return
@@ -122,16 +122,37 @@ func (g *gateway) serviceHealth(c *gin.Context) {
 		}()
 	}
 
-	services := gin.H{"gateway": "up"}
-	status := "ok"
+	services, allUp = gin.H{"gateway": "up"}, true
 	for range g.services {
 		r := <-results
 		if r.up {
 			services[r.name] = "up"
 		} else {
 			services[r.name] = "down"
-			status = "degraded"
+			allUp = false
 		}
 	}
+	return services, allUp
+}
+
+// serviceHealth shows which services are alive. Handy when something does not work: it names the
+// container that is the problem. It always answers 200; use /ready to act on the result.
+func (g *gateway) serviceHealth(c *gin.Context) {
+	services, allUp := g.probeServices(c.Request.Context(), "/health")
+	status := "ok"
+	if !allUp {
+		status = "degraded"
+	}
 	c.JSON(http.StatusOK, gin.H{"status": status, "services": services})
+}
+
+// ready answers 200 only when every service is ready (alive and able to reach its database),
+// else 503. A monitor or deploy script polls this to know the whole system works.
+func (g *gateway) ready(c *gin.Context) {
+	services, allUp := g.probeServices(c.Request.Context(), "/ready")
+	if !allUp {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unavailable", "services": services})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ready", "services": services})
 }

@@ -26,6 +26,7 @@ func NewRouter(s *store.Store) *gin.Engine {
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "workout-service"})
 	})
+	r.GET("/ready", readiness("workout-service", s))
 
 	v1 := r.Group("/api/v1", requireUser())
 	v1.GET("/exercises", h.listExercises)

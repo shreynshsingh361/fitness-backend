@@ -87,6 +87,26 @@ func (h *handler) verifyPassword(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// userExists answers the gateway's question "is this account still there?": 204 if so, 404 if it
+// was deleted (or never existed). No body, and nothing about the person.
+func (h *handler) userExists(c *gin.Context) {
+	id := c.Param("id")
+	if _, err := uuid.Parse(id); err != nil {
+		fail(c, http.StatusNotFound, "not_found", "no such user", nil)
+		return
+	}
+	exists, err := h.store.UserExists(c.Request.Context(), id)
+	if err != nil {
+		serverError(c, err)
+		return
+	}
+	if !exists {
+		fail(c, http.StatusNotFound, "not_found", "no such user", nil)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
 // deleteUser removes the account and all its sessions. It is safe to repeat.
 func (h *handler) deleteUser(c *gin.Context) {
 	id := c.Param("id")

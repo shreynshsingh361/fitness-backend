@@ -60,3 +60,18 @@ func TestRefreshTokens(t *testing.T) {
 		t.Fatal("refresh tokens must be unique")
 	}
 }
+
+// A token carries the id of the secret that signed it, the same name the gateway computes.
+func TestAccessTokenNamesItsSigningKey(t *testing.T) {
+	tok, err := NewMaker(secret, time.Minute).NewAccessToken("user-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _, err := jwt.NewParser().ParseUnverified(tok, jwt.MapClaims{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.Header["kid"]; got != KeyID(secret) {
+		t.Fatalf("kid header = %v, want %s", got, KeyID(secret))
+	}
+}

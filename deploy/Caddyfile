@@ -1,0 +1,33 @@
+# Caddy is the only thing the internet can reach. It gets and renews the HTTPS certificate by
+# itself (Let's Encrypt) and hands API requests to the gateway.
+#
+# API_HOST is a name that points at this server: your own domain, or one that needs no domain
+# at all, like api.203-0-113-7.sslip.io for the server 203.0.113.7.
+{$API_HOST} {
+	encode gzip
+
+	# Only the API and the health check go through. Everything else (the gateway's
+	# /health/services, scanners looking for /admin or /.env) gets a plain 404.
+	handle /api/* {
+		reverse_proxy gateway:8080
+	}
+	handle /health {
+		reverse_proxy gateway:8080
+	}
+	handle {
+		respond "not found" 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+	request_body {
+		max_size 2MB
+	}
+	log {
+		output stdout
+		format console
+	}
+}

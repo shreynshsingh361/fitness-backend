@@ -1,0 +1,63 @@
+# Runs on every push and pull request: formatting, vet and tests for the gateway and each service.
+# The tests that need a database (a retry storm, a rush to join a full group, two services
+# migrating at once, a stolen token) run against a throwaway Postgres started here.
+name: backend
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [gateway, services/auth-service, services/workout-service, services/nutrition-service, services/activity-service, services/social-service]
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      PGPASSWORD: test
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: Prepare the throwaway databases
+        run: |
+          psql -h localhost -U postgres -c "CREATE ROLE nutrition_svc" -c "CREATE ROLE social_svc" || true
+          for db in auth_test nutrition_test social_test; do psql -h localhost -U postgres -c "CREATE DATABASE $db"; done
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        env:
+          AUTH_TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/auth_test?sslmode=disable
+          NUTRITION_TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/nutrition_test?sslmode=disable
+          SOCIAL_TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/social_test?sslmode=disable
+        # -p 1: packages one after the other, because the database tests share one database.
+        run: go test -p 1 -race ./...
+
+  compose:
+    # The production compose file must stay valid, and the contract must stay readable.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Production compose is valid (with throwaway values)
+        run: |
+          export API_HOST=example.test FIREBASE_PROJECT_ID=x JWT_SECRET=$(openssl rand -hex 32) POSTGRES_PASSWORD=x
+          for n in AUTH WORKOUT NUTRITION ACTIVITY SOCIAL; do export ${n}_DB_PASSWORD=$(openssl rand -hex 24); done
+          docker compose -f docker-compose.prod.yml config -q
+      - name: The API contract parses
+        run: python3 -c "import sys, json; import re; s=open('contracts/openapi.yaml').read(); assert 'openapi: 3.0.3' in s and len(s) > 1000"

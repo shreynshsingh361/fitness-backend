@@ -197,17 +197,29 @@ func (s *Store) SaveRecipe(ctx context.Context, userID, id string, in RecipeInpu
 		}
 	}
 
-	for i, it := range in.Ingredients {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO recipe_ingredients (recipe_id, position, food_id, servings) VALUES ($1, $2, $3, $4)`,
-			id, i, it.FoodID, it.Servings); err != nil {
-			return Recipe{}, err
-		}
+	if err := insertIngredients(ctx, tx, id, in.Ingredients); err != nil {
+		return Recipe{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Recipe{}, err
 	}
 	return s.Recipe(ctx, userID, id)
+}
+
+// insertIngredients saves all of a recipe's ingredients in one statement, in the order given
+// (position 0, 1, 2...). One round trip however many ingredients there are, instead of one each.
+func insertIngredients(ctx context.Context, tx pgx.Tx, recipeID string, items []IngredientInput) error {
+	foodIDs := make([]string, len(items))
+	servings := make([]float64, len(items))
+	for i, it := range items {
+		foodIDs[i], servings[i] = it.FoodID, it.Servings
+	}
+	_, err := tx.Exec(ctx,
+		`INSERT INTO recipe_ingredients (recipe_id, position, food_id, servings)
+		 SELECT $1, ord - 1, food_id, servings
+		 FROM unnest($2::uuid[], $3::float8[]) WITH ORDINALITY AS t(food_id, servings, ord)`,
+		recipeID, foodIDs, servings)
+	return err
 }
 
 // DeleteRecipe deletes one of the user's recipes with its ingredients. Days it was logged

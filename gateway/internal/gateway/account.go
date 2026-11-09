@@ -34,7 +34,7 @@ func (g *gateway) deleteAccount(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, "unauthorized", "missing, invalid or expired access token", nil)
 		return
 	}
-	if !g.attempts.limit(c) {
+	if !g.attempts.limit(c, c.ClientIP()) {
 		return
 	}
 	// The password, or for an account that signs in with Firebase, a fresh Firebase sign-in.
@@ -78,6 +78,17 @@ func (g *gateway) deleteAccount(c *gin.Context) {
 		return
 	}
 
+	// From here on the account is refused, so no request (a second phone still signed in, an
+	// offline queue sending late) can add new data while the old data is being removed. If
+	// deletion stops part-way and the login is kept, the account is let back in.
+	g.accounts.markDeleted(userID)
+	deleted := false
+	defer func() {
+		if !deleted {
+			g.accounts.unmark(userID)
+		}
+	}()
+
 	// 2. The data, in every service at the same time.
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -119,6 +130,7 @@ func (g *gateway) deleteAccount(c *gin.Context) {
 			"your data was deleted but your login could not be; please try again", nil)
 		return
 	}
+	deleted = true // the account stays refused: its old tokens must not work again
 	c.Status(http.StatusNoContent)
 }
 

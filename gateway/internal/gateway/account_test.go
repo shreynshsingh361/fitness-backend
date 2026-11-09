@@ -13,22 +13,38 @@ import (
 	"time"
 )
 
-// callLog records which service was asked what, in order, across goroutines.
+// callLog records which service was asked what, in order, across goroutines. The gateway's own
+// "does this account still exist?" check on every signed-in request is kept apart (see checks):
+// the tests below are about what account deletion does, not about that guard.
 type callLog struct {
-	mu    sync.Mutex
-	calls []string
+	mu     sync.Mutex
+	calls  []string
+	checks []string
 }
 
+// add records one call; the existence check goes to its own list.
 func (l *callLog) add(call string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if strings.HasSuffix(call, "/exists") {
+		l.checks = append(l.checks, call)
+		return
+	}
 	l.calls = append(l.calls, call)
 }
 
+// all returns the calls made so far, not counting existence checks.
 func (l *callLog) all() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return slices.Clone(l.calls)
+}
+
+// existenceChecks returns the "does this account still exist?" calls made so far.
+func (l *callLog) existenceChecks() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.checks)
 }
 
 // accountService is a fake service that records calls and answers with a fixed status.

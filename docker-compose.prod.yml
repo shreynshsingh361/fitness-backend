@@ -1,0 +1,190 @@
+# The backend on a real server:  docker compose -f docker-compose.prod.yml up -d --build
+#
+#   internet ──HTTPS──> caddy :80/:443 ──> gateway :8080 ──> the five services ──> postgres
+#
+# Differences from docker-compose.yml (which is for your own computer):
+#  - Caddy is the only container that publishes a port. The gateway and the services do not.
+#  - Every password and secret comes from .env (make it with scripts/make-prod-env.sh). There are
+#    no development defaults here: a missing value stops the start instead of using a weak one.
+#  - APP_ENV=production: the services refuse a short or well-known JWT_SECRET.
+#  - The old unverified sign-up and login are off.
+#  - Container logs are rotated, so a busy week cannot fill the disk.
+
+name: hxvy
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  logging: &logging
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  networks: [internal]
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:?set AUTH_DB_PASSWORD in .env}
+      WORKOUT_DB_PASSWORD: ${WORKOUT_DB_PASSWORD:?set WORKOUT_DB_PASSWORD in .env}
+      NUTRITION_DB_PASSWORD: ${NUTRITION_DB_PASSWORD:?set NUTRITION_DB_PASSWORD in .env}
+      ACTIVITY_DB_PASSWORD: ${ACTIVITY_DB_PASSWORD:?set ACTIVITY_DB_PASSWORD in .env}
+      SOCIAL_DB_PASSWORD: ${SOCIAL_DB_PASSWORD:?set SOCIAL_DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init-prod.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    # No ports: only containers on the internal network reach the database.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging: *logging
+    networks: [internal]
+
+  auth-service:
+    <<: *service-defaults
+    build: ./services/auth-service
+    environment:
+      PORT: "8081"
+      DATABASE_URL: postgres://auth_svc:${AUTH_DB_PASSWORD}@postgres:5432/auth_db
+      APP_ENV: production
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:?set FIREBASE_PROJECT_ID in .env}
+      # The old sign-up and login, where nobody checks the email. Never on a real server.
+      LEGACY_PASSWORD_AUTH: "false"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  workout-service:
+    <<: *service-defaults
+    build: ./services/workout-service
+    environment:
+      PORT: "8082"
+      DATABASE_URL: postgres://workout_svc:${WORKOUT_DB_PASSWORD}@postgres:5432/workout_db
+      APP_ENV: production
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8082/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nutrition-service:
+    <<: *service-defaults
+    build: ./services/nutrition-service
+    environment:
+      PORT: "8083"
+      DATABASE_URL: postgres://nutrition_svc:${NUTRITION_DB_PASSWORD}@postgres:5432/nutrition_db
+      APP_ENV: production
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8083/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  activity-service:
+    <<: *service-defaults
+    build: ./services/activity-service
+    environment:
+      PORT: "8084"
+      DATABASE_URL: postgres://activity_svc:${ACTIVITY_DB_PASSWORD}@postgres:5432/activity_db
+      APP_ENV: production
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8084/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  social-service:
+    <<: *service-defaults
+    build: ./services/social-service
+    environment:
+      PORT: "8085"
+      DATABASE_URL: postgres://social_svc:${SOCIAL_DB_PASSWORD}@postgres:5432/social_db
+      APP_ENV: production
+      ACTIVITY_URL: http://activity-service:8084
+      AUTH_URL: http://auth-service:8081
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8085/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build: ./gateway
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      # While rotating the secret: the old one, still accepted for 15 minutes. See DEPLOY.md.
+      JWT_SECRET_PREVIOUS: ${JWT_SECRET_PREVIOUS:-}
+      APP_ENV: production
+      AUTH_URL: http://auth-service:8081
+      WORKOUT_URL: http://workout-service:8082
+      NUTRITION_URL: http://nutrition-service:8083
+      ACTIVITY_URL: http://activity-service:8084
+      SOCIAL_URL: http://social-service:8085
+      # The phone app is not a browser, so it needs no CORS entry. Empty means NO browser origin is
+      # allowed (in production the gateway does not fall back to localhost). To serve a web app, list
+      # its address here, such as https://app.example.com.
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      # Caddy is the proxy in front: trust it to say who the real client is, so the limit on
+      # sign-in attempts counts each person on their own, not all of them as Caddy. Nothing but
+      # Caddy can reach the gateway (it publishes no port), so every private address range is
+      # trusted rather than one pinned subnet: a fixed range can clash with the network the server
+      # lives in (an AWS default VPC is 172.31.0.0/16, for one).
+      TRUSTED_PROXIES: 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      AUTH_ATTEMPTS_PER_MINUTE: ${AUTH_ATTEMPTS_PER_MINUTE:-20}
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      workout-service:
+        condition: service_healthy
+      nutrition-service:
+        condition: service_healthy
+      activity-service:
+        condition: service_healthy
+      social-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *logging
+    networks: [internal]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      API_HOST: ${API_HOST:?set API_HOST in .env}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # the HTTPS certificates: keep them, or Let's Encrypt may limit you
+      - caddy_config:/config
+    depends_on:
+      gateway:
+        condition: service_healthy
+    logging: *logging
+    networks: [internal]
+
+networks:
+  internal: {} # Docker picks a free address range, so it cannot clash with the host's network
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

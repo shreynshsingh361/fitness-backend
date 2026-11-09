@@ -17,7 +17,7 @@ import (
 const (
 	dateLayout = "2006-01-02"
 
-	maxDeviceSteps  = 200000 // more than anyone walks in a day; a limit on bad data
+	maxDeviceSteps  = 100000 // more than a person walks in a day (ultra-marathon days included): a limit on bad data and cheating
 	maxSyncDays     = 60     // how many days one sync may carry
 	maxSyncBackDays = 3660   // how far back a day may be: 10 years of history from the health apps
 	maxHistoryDays  = 366
@@ -51,6 +51,7 @@ func NewRouter(s *store.Store) *gin.Engine {
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "activity-service"})
 	})
+	r.GET("/ready", readiness("activity-service", s))
 
 	steps := r.Group("/api/v1/steps", requireUser())
 	steps.POST("/sync", h.sync)

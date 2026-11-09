@@ -12,3 +12,7 @@
 
 # Downloaded food databases (large; fetched by scripts/import-foods.sh)
 data/
+
+# Deploy bookkeeping (written by scripts/deploy.sh)
+.previous
+.last-good

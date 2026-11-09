@@ -19,15 +19,27 @@ import (
 
 const Issuer = "fitness-auth"
 
+// KeyID names a signing secret without revealing it: the first eight hex digits of its SHA-256.
+// It goes in each token's "kid" header, so the gateway can tell which secret signed it while a
+// secret is being rotated out. The gateway has its own copy of this function.
+func KeyID(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:4])
+}
+
+// Maker signs and checks access tokens with one secret.
 type Maker struct {
 	secret    []byte
+	keyID     string
 	accessTTL time.Duration
 }
 
+// NewMaker makes a Maker that signs with secret and gives tokens accessTTL to live.
 func NewMaker(secret string, accessTTL time.Duration) *Maker {
-	return &Maker{secret: []byte(secret), accessTTL: accessTTL}
+	return &Maker{secret: []byte(secret), keyID: KeyID(secret), accessTTL: accessTTL}
 }
 
+// AccessTTL is how long a new access token stays valid.
 func (m *Maker) AccessTTL() time.Duration { return m.accessTTL }
 
 // NewAccessToken signs a JWT whose "sub" (subject) is the user's id.
@@ -39,7 +51,9 @@ func (m *Maker) NewAccessToken(userID string) (string, error) {
 		IssuedAt:  jwt.NewNumericDate(now),
 		ExpiresAt: jwt.NewNumericDate(now.Add(m.accessTTL)),
 	}
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(m.secret)
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["kid"] = m.keyID
+	return token.SignedString(m.secret)
 }
 
 // Parse checks the signature, issuer and expiry and returns the user id.
@@ -70,6 +84,8 @@ func NewRefreshToken() (raw, hash string, err error) {
 	return raw, HashRefreshToken(raw), nil
 }
 
+// HashRefreshToken is what is stored in the database instead of the refresh token itself, so a
+// leaked database does not leak working sessions.
 func HashRefreshToken(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])

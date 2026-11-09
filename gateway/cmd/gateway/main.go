@@ -17,6 +17,7 @@ import (
 )
 
 func main() {
+	setupLogging()
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -26,13 +27,14 @@ func main() {
 	}
 
 	handler, err := gateway.New(gateway.Config{
-		JWTSecret:    cfg.JWTSecret,
-		AuthURL:      cfg.AuthURL,
-		WorkoutURL:   cfg.WorkoutURL,
-		NutritionURL: cfg.NutritionURL,
-		ActivityURL:  cfg.ActivityURL,
-		SocialURL:    cfg.SocialURL,
-		CORSOrigins:  cfg.CORSOrigins,
+		JWTSecret:         cfg.JWTSecret,
+		JWTSecretPrevious: cfg.JWTSecretPrevious,
+		AuthURL:           cfg.AuthURL,
+		WorkoutURL:        cfg.WorkoutURL,
+		NutritionURL:      cfg.NutritionURL,
+		ActivityURL:       cfg.ActivityURL,
+		SocialURL:         cfg.SocialURL,
+		CORSOrigins:       cfg.CORSOrigins,
 
 		TrustedProxies:        cfg.TrustedProxies,
 		AuthAttemptsPerMinute: cfg.AuthAttemptsPerMinute,
@@ -41,11 +43,7 @@ func main() {
 		log.Fatalf("gateway: %v", err)
 	}
 
-	srv := &http.Server{
-		Addr:              ":" + cfg.Port,
-		Handler:           handler,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	srv := gateway.NewServer(":"+cfg.Port, handler)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

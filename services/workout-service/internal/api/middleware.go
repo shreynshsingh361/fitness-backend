@@ -1,7 +1,7 @@
 package api
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -9,16 +9,25 @@ import (
 	"github.com/google/uuid"
 )
 
-// requestLog prints one line per request. The request id is created by the
-// gateway, so you can follow a single click through every service's logs.
+// requestLog writes one structured log line per request (not for the health checks, which Docker
+// repeats every few seconds): the request id (it follows the request through every service),
+// the user, the route, the status and how long it took. A 5xx is logged at error level.
 func requestLog() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
-		log.Printf("req=%s user=%s %s %s -> %d (%s)",
-			c.GetHeader("X-Request-ID"), c.GetHeader("X-User-ID"),
-			c.Request.Method, c.Request.URL.Path,
-			c.Writer.Status(), time.Since(start).Round(time.Millisecond))
+		path := c.Request.URL.Path
+		if path == "/health" || path == "/ready" {
+			return
+		}
+		level := slog.LevelInfo
+		if c.Writer.Status() >= http.StatusInternalServerError {
+			level = slog.LevelError
+		}
+		slog.Log(c.Request.Context(), level, "request",
+			"req", c.GetHeader("X-Request-ID"), "user", c.GetHeader("X-User-ID"),
+			"method", c.Request.Method, "path", path, "status", c.Writer.Status(),
+			"ms", time.Since(start).Milliseconds())
 	}
 }
 

@@ -59,7 +59,7 @@ services:
       # The old sign-up and login, where nobody checks the email. Off unless set to "true".
       LEGACY_PASSWORD_AUTH: ${LEGACY_PASSWORD_AUTH:-false}
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/ready"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -71,7 +71,7 @@ services:
       PORT: "8082"
       DATABASE_URL: postgres://workout_svc:workout_dev_password@postgres:5432/workout_db
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8082/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8082/ready"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -83,7 +83,7 @@ services:
       PORT: "8083"
       DATABASE_URL: postgres://nutrition_svc:nutrition_dev_password@postgres:5432/nutrition_db
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8083/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8083/ready"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -95,7 +95,7 @@ services:
       PORT: "8084"
       DATABASE_URL: postgres://activity_svc:activity_dev_password@postgres:5432/activity_db
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8084/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8084/ready"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -110,7 +110,7 @@ services:
       ACTIVITY_URL: http://activity-service:8084
       AUTH_URL: http://auth-service:8081
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8085/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8085/ready"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -121,6 +121,7 @@ services:
     environment:
       PORT: "8080"
       JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me-before-deploying}
+      JWT_SECRET_PREVIOUS: ${JWT_SECRET_PREVIOUS:-}
       AUTH_URL: http://auth-service:8081
       WORKOUT_URL: http://workout-service:8082
       NUTRITION_URL: http://nutrition-service:8083

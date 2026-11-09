@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"net/mail"
 	"strings"
@@ -37,6 +38,7 @@ func NewRouter(s *store.Store, tokens *token.Maker, fb IDTokenVerifier, legacyPa
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "auth-service"})
 	})
+	r.GET("/ready", readiness("auth-service", s))
 
 	auth := r.Group("/api/v1/auth")
 	auth.POST("/register", h.legacyOnly, h.register)
@@ -52,6 +54,7 @@ func NewRouter(s *store.Store, tokens *token.Maker, fb IDTokenVerifier, legacyPa
 	internal := r.Group("/internal/users")
 	internal.POST("/lookup", h.lookupUsers)
 	internal.POST("/:id/verify-password", h.verifyPassword)
+	internal.GET("/:id/exists", h.userExists)
 	internal.DELETE("/:id", h.deleteUser)
 	return r
 }
@@ -183,6 +186,12 @@ func (h *handler) refresh(c *gin.Context) {
 	}
 	userID, err := h.store.RotateRefreshToken(c.Request.Context(),
 		token.HashRefreshToken(in.RefreshToken), newHash, time.Now().Add(refreshTTL))
+	if errors.Is(err, store.ErrTokenReused) {
+		// The same message as any other bad token, so a thief learns nothing from it.
+		log.Printf("req=%s refresh token reuse: every session of that user was ended", c.GetHeader("X-Request-ID"))
+		fail(c, http.StatusUnauthorized, "invalid_refresh_token", "refresh token is invalid, expired or already used", nil)
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		fail(c, http.StatusUnauthorized, "invalid_refresh_token", "refresh token is invalid, expired or already used", nil)
 		return

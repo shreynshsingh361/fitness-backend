@@ -53,3 +53,14 @@ func TestVerifyPasswordNeedsJSON(t *testing.T) {
 		t.Errorf("status = %d, want 400", got)
 	}
 }
+
+// The gateway's "is this account still there?" route refuses ids that are not uuids with a plain
+// 404, before any database call.
+func TestUserExistsRefusesBadIDs(t *testing.T) {
+	r := newTestRouter()
+	for _, id := range []string{"not-a-uuid", "123", "..%2Fetc"} {
+		if got := do(r, "GET", "/internal/users/"+id+"/exists", "", nil).Code; got != http.StatusNotFound {
+			t.Errorf("exists for %q: status = %d, want 404", id, got)
+		}
+	}
+}

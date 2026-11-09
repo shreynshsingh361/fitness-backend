@@ -34,6 +34,19 @@ info:
     the same `client_op_id` again returns the already-saved record with status 200
     instead of creating a duplicate, so retries after a network failure are safe.
 
+    **Deleted accounts.** When an account is deleted its tokens stop working at once (`401`), not when they
+    expire, and the refresh token is gone with the account.
+
+    **Limits.** Every endpoint is covered by these, so a client must expect the two answers.
+    - A request body may be at most **1 MiB**: a bigger one is refused with `413`.
+    - A signed-in user may make at most **600 requests a minute** in total, and at most
+      **30 barcode lookups a minute**. Over the limit the answer is `429` with a `Retry-After`
+      header (seconds to wait). Sign-in, sign-up and account deletion are limited per IP
+      address instead (20 a minute by default).
+    - A day of steps above **100,000** is refused with `422`: no person walks more.
+    - The server drops a connection that sends or reads too slowly (15 s to read a request,
+      30 s to write the answer, 60 s idle).
+
     **Dates.** `date` / `eaten_on` values are calendar dates (`YYYY-MM-DD`) in the
     user's own time zone. Timestamps are UTC (RFC 3339).
 servers:
@@ -49,11 +62,63 @@ tags:
   - name: Groups
   - name: Dashboard
   - name: Account
+  - name: Operations
 
 security:
   - bearerAuth: []
 
 paths:
+  /health:
+    get:
+      tags: [Operations]
+      summary: Is the gateway running? (liveness)
+      description: Answers 200 while the process runs. It does not look at the services or the databases.
+      servers: [{ url: "http://localhost:8080" }]
+      security: []
+      responses:
+        "200":
+          description: Running
+          content:
+            application/json:
+              schema: { type: object, properties: { status: { type: string, example: ok }, service: { type: string, example: gateway } } }
+  /ready:
+    get:
+      tags: [Operations]
+      summary: Can the system do its job? (readiness)
+      description: |
+        200 only when every service answers and can reach its own database; otherwise 503 and the
+        body names the service that is down. Not reachable from the internet in production (the
+        proxy passes only `/api/*` and `/health`): ask from the server itself. Each service has the
+        same `/ready` for the gateway and Docker.
+      servers: [{ url: "http://localhost:8080" }]
+      security: []
+      responses:
+        "200":
+          description: Everything is ready
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+        "503":
+          description: At least one service is not ready
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+  /metrics:
+    get:
+      tags: [Operations]
+      summary: Request counts and latency, in the Prometheus text format
+      description: |
+        `gateway_requests_total{service,code}`, `gateway_request_duration_seconds` (a histogram, for
+        p50 and p99) and `gateway_rate_limited_total`. Not reachable from the internet in production;
+        read it from the server itself. Counters reset when the gateway restarts.
+      servers: [{ url: "http://localhost:8080" }]
+      security: []
+      responses:
+        "200":
+          description: Prometheus text
+          content:
+            text/plain:
+              schema: { type: string }
   /auth/register:
     post:
       tags: [Auth]
@@ -71,6 +136,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/AuthResponse" }
         "409": { $ref: "#/components/responses/EmailTaken" }
+        "410":
+          description: Sign-up with an email nobody checks has ended on this server (`use_firebase`). Use `POST /auth/firebase`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "422": { $ref: "#/components/responses/ValidationError" }
 
   /auth/login:
@@ -91,6 +161,11 @@ paths:
               schema: { $ref: "#/components/schemas/AuthResponse" }
         "401":
           description: Wrong email or password (the same answer for both, so emails cannot be probed)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "410":
+          description: This way of signing in has ended on this server (`use_firebase`). Use `POST /auth/firebase`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -532,6 +607,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Food" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "404":
           description: No product has that barcode (`not_found`), or it lists no nutrition (`no_nutrition`)
           content:
@@ -881,6 +957,8 @@ paths:
                 properties:
                   synced: { type: integer, description: Number of days saved }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "422": { $ref: "#/components/responses/ValidationError" }
 
   /steps/today:
@@ -1643,6 +1721,20 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+    PayloadTooLarge:
+      description: The request body is over 1 MiB (`payload_too_large`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooManyRequests:
+      description: Over a rate limit (`too_many_attempts`); wait `Retry-After` seconds and try again
+      headers:
+        Retry-After:
+          description: Seconds until the next request is allowed
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     AdminOnly:
       description: Only a group admin can do this
       content:
@@ -1795,6 +1887,14 @@ components:
         achieved_at: { type: string, format: date-time }
 
     # ---------- nutrition ----------
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, unavailable] }
+        services:
+          type: object
+          description: Each service, `up` or `down`
+          additionalProperties: { type: string, enum: [up, down] }
     Food:
       type: object
       description: |
@@ -1936,7 +2036,7 @@ components:
             required: [date, steps]
             properties:
               date: { type: string, format: date }
-              steps: { type: integer, minimum: 0, maximum: 200000 }
+              steps: { type: integer, minimum: 0, maximum: 100000 }
     StepSource:
       type: object
       properties:

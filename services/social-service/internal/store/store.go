@@ -23,6 +23,9 @@ type Store struct {
 	db *pgxpool.Pool
 }
 
+// Ping reports whether the database answers. The readiness check uses it.
+func (s *Store) Ping(ctx context.Context) error { return s.db.Ping(ctx) }
+
 func New(db *pgxpool.Pool) *Store { return &Store{db: db} }
 
 // newCode makes a random, unguessable invite code that is safe to put in a link.

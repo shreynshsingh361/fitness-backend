@@ -204,3 +204,28 @@ func TestInternalDeleteRejectsBadID(t *testing.T) {
 		t.Fatalf("status = %d, want 404", got)
 	}
 }
+
+// Break #5: the cheat. The competition is only fun if the numbers are believable, and anyone with
+// their own token can send any steps with curl. No phone can be proven honest from the server, but
+// a day of more than 100,000 steps is more than a person can walk, so it must be refused. The
+// legitimate top (an ultra-marathon day) still goes through.
+func TestBreak5ImpossibleStepDaysAreRefused(t *testing.T) {
+	today := time.Now().UTC().Format(dateLayout)
+	check := func(steps int) map[string]string {
+		_, problems := validateSync(syncInput{Source: "health_connect", Days: []struct {
+			Date  string `json:"date"`
+			Steps int    `json:"steps"`
+		}{{Date: today, Steps: steps}}}, time.Now())
+		return problems
+	}
+	for _, steps := range []int{0, 12000, 100000} {
+		if p := check(steps); len(p) > 0 {
+			t.Errorf("%d steps in a day is possible and must be accepted, got %v", steps, p)
+		}
+	}
+	for _, steps := range []int{100001, 150000, 199999, 200000} {
+		if p := check(steps); len(p) == 0 {
+			t.Errorf("%d steps in a day is not humanly possible and must be refused", steps)
+		}
+	}
+}
