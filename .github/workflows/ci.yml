@@ -60,4 +60,5 @@ jobs:
           for n in AUTH WORKOUT NUTRITION ACTIVITY SOCIAL; do export ${n}_DB_PASSWORD=$(openssl rand -hex 24); done
           docker compose -f docker-compose.prod.yml config -q
       - name: The API contract parses
-        run: python3 -c "import sys, json; import re; s=open('contracts/openapi.yaml').read(); assert 'openapi: 3.0.3' in s and len(s) > 1000"
+        run: |
+          ruby -ryaml -e 'YAML.load_file("contracts/openapi.yaml")'
